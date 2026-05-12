@@ -17,7 +17,6 @@ N_IPA = 8
 # minimum variance allowed to prevent sigma collapse
 SIG_FLOOR = 0.3
 
-
 class qFitLatent(nn.Module):
     ''' 
     SE(3) invariant model for learning protein dynamics
@@ -146,7 +145,7 @@ class ChiGMMHead(nn.Module):
         - mu: [N, k * d_chi] predicted average chi angles per component
         - sigma: [N, k * d_chi] predicted variance per chi angle per component
     '''
-    def __init__(self, d_single, k = 4, d_chi = N_CHI):
+    def __init__(self, d_single, k = 5, d_chi = N_CHI):
         super().__init__() # inherit module
         # dims of outputs
         self.k = k

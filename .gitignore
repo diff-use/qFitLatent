@@ -11,3 +11,4 @@ submit_train.sge
 select_subsets.py
 *.csv
 *.json
+*.png

@@ -55,9 +55,7 @@ def run_epoch(
         sym_mask = sym_tbl[aa]
 
         with torch.set_grad_enabled(training):
-            with torch.autocast(device_type="cuda", dtype=torch.float32):
-                # forward pass
-                pi, mu, sigma = model(aa, R, t)
+            pi, mu, sigma = model(aa, R, t)
 
             # calculate loss
             out = loss_function(
