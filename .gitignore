@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+
+logs/
+checkpoints/
+plots/
+validation/
+
+plot*.py
+submit_train.sge
+select_subsets.py
+*.csv
+*.json
