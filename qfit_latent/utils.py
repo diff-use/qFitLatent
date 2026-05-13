@@ -72,6 +72,8 @@ def run_epoch(
         if training:
             # backprop and step
             loss.backward()
+            # gradient clipping to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
 
@@ -145,7 +147,7 @@ def train(
     model.to(device)
 
     # set up the optimizer (load from previous state if passed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.5)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
@@ -169,12 +171,15 @@ def train(
     )
     has_val = val_loader is not None
 
-    # set up the scheduler to go per step (load if passed)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max = len(train_loader) * epochs, eta_min=lr / 100
+    # set up the scheduler: linear warmup → cosine; rebuild fresh from remaining
+    # epochs so resume after architecture/length changes is well-defined
+    remaining = max(1, epochs - start_epoch) * len(train_loader)
+    warmup = min(500, remaining // 20)
+    warm = torch.optim.lr_scheduler.LinearLR(optimizer, 1e-3, 1.0, warmup)
+    cos  = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, remaining - warmup, eta_min=lr / 100
     )
-    if sched_state is not None:
-        sched.load_state_dict(sched_state)
+    sched = torch.optim.lr_scheduler.SequentialLR(optimizer, [warm, cos], [warmup])
 
     # determine whether loss csv already exists or not and write header if not
     write_header = not loss_csv.exists() or loss_csv.stat().st_size == 0

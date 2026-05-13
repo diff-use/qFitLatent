@@ -12,10 +12,8 @@ import math
 from .data.data import N_CHI, N_CHI_PER_AA
 
 # global parameters
-# number of IPA blocks
-N_IPA = 8
 # minimum variance allowed to prevent sigma collapse
-SIG_FLOOR = 0.3
+SIG_FLOOR = 0.15
 
 class qFitLatent(nn.Module):
     ''' 
@@ -39,10 +37,12 @@ class qFitLatent(nn.Module):
         n_aa = 21,
         d_single = 128,
         d_pair = 32,
+        n_ipa = 8,
         n_heads = 8,
         n_geom_attn_qpts = 4,
         n_geom_attn_vpts = 8,
         c = 8,
+        k = 5,
         dropout = 0.0,
     ):
         super().__init__() # inherit nn 
@@ -74,13 +74,13 @@ class qFitLatent(nn.Module):
         # build the IPA layers
         self.ipa_blocks = nn.ModuleList(
             [IPABlock(d_single, d_pair, dropout=dropout, **ipa_hyperparams)
-            for _ in range(N_IPA)]
+            for _ in range(n_ipa)]
         )
 
         # build the chi angle GMM prediction head (output layer)
         self.chigmm_head = ChiGMMHead(
             d_single, 
-            k=4,
+            k=k,
             d_chi=N_CHI,
         )
 
@@ -110,18 +110,19 @@ class qFitLatent(nn.Module):
         thresholds = torch.arange(N_CHI, device=aa_tokens.device)
         return thresholds[None, :] < counts[aa_tokens, None] # [N, N_CHI] bool
     
-    # a forward pass 
-    def forward(self, aa_tokens, R, t): 
+    # a forward pass
+    def forward(self, aa_tokens, R, t):
         # embed sequence tokens and prepare pair track
         s = self.aa_embed(aa_tokens)
         z = self.pair_init(s, t)
 
-        # iterate through blocks and pass info
+        # iterate through blocks and pass info; pair track is now updated
+        # in-place by each block via the triangle multiplication
         for block in self.ipa_blocks:
             if self.training: # load from checkpoint and resume
-                s = _checkpoint(block, s, z, R, t, use_reentrant=False)
+                s, z = _checkpoint(block, s, z, R, t, use_reentrant=False)
             else: # forward pass
-                s = block(s, z, R, t)
+                s, z = block(s, z, R, t)
         
         chi_mask = self.chi_mask(aa_tokens)
         return self.chigmm_head(s, chi_mask) # pi [N,k], mu [N, k, N_CHI], sigma [N, k, N_CHI]
@@ -161,7 +162,8 @@ class ChiGMMHead(nn.Module):
         *batch, _ = h.shape
         k, d = self.k, self.d_chi
         pi = torch.softmax(self.pi_proj(h).float(), dim=-1)
-        mu    = self.mu_proj(h).float().view(*batch, k, d)
+        # wrap the prediction of chi angles to the circle
+        mu    = math.pi * torch.tanh(self.mu_proj(h).float()).view(*batch, k, d)
         sigma = F.softplus(self.sigma_proj(h)).float().view(*batch, k, d) + SIG_FLOOR
         # apply chi mask to hide chi angles that dont exist in residues
         if chi_mask is not None:
@@ -295,9 +297,47 @@ class IPABlock(nn.Module):
             nn.Linear(d_single*4, d_single)
         )
         self.dropout = nn.Dropout(dropout)
+        # AF-style triangle multiplicative update on the pair rep
+        self.triangle = TriangleUpdate(d_pair)
 
-    # a pass through the full IPA with dropout    
+    # a pass through the full IPA with dropout
     def forward(self, s, z, R, t):
         s = s + self.dropout(self.ipa(self.norm1(s), z, R, t))
         s = s + self.dropout(self.ff(self.norm2(s)))
-        return s
+        # update the pair representation with one outgoing triangle multiply
+        z = z + self.dropout(self.triangle(z))
+        return s, z
+
+
+class TriangleUpdate(nn.Module):
+    '''
+    AlphaFold-style triangle multiplicative update (outgoing direction). For
+    each pair (i,j), aggregates information from all (i,k) and (j,k) edges
+    via an outer contraction over k:
+
+        z_ij ← Out( Sum_k a_ik * b_jk )
+
+    This injects structural triangle-inequality priors into the pair track
+    so it can carry geometric relations between residues, rather than being
+    a static bias.
+
+    Inputs:
+        - z: [N, N, d_pair] pair representation
+
+    Outputs:
+        - delta: [N, N, d_pair] update to add residually to z
+    '''
+    def __init__(self, d_pair):
+        super().__init__() # inherit
+        # layernorm the pair input before projecting
+        self.norm = nn.LayerNorm(d_pair)
+        # the two triangle edge projections (a for i-k, b for j-k)
+        self.a = nn.Linear(d_pair, d_pair)
+        self.b = nn.Linear(d_pair, d_pair)
+        # output projection after the triangle contraction
+        self.out = nn.Linear(d_pair, d_pair)
+
+    def forward(self, z):
+        z_n = self.norm(z)
+        # outgoing triangle: sum over k of a_ik * b_jk -> [N, N, d_pair]
+        return self.out(torch.einsum("ikd,jkd->ijd", self.a(z_n), self.b(z_n)))
