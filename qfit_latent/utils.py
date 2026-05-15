@@ -147,7 +147,7 @@ def train(
     model.to(device)
 
     # set up the optimizer (load from previous state if passed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
@@ -189,7 +189,7 @@ def train(
         writer.writerow(_csv_header(has_val))
 
     # the learning rate csv tracker:
-    lr_csv = Path("logs/lr_schedule.csv")
+    lr_csv = loss_csv.with_name(loss_csv.stem + "_lr.csv")
     write_lr_header = not lr_csv.exists() or lr_csv.stat().st_size == 0
     lr_fh = open(lr_csv, "a", newline="")
     lr_writer = csv.writer(lr_fh)

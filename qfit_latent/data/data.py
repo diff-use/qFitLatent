@@ -246,10 +246,19 @@ def get_chi_info(altlocs, resname, max=MAX_ALTLOCS):
         angles = np.zeros(N_CHI, dtype=np.float32)
         valid = True
 
+        # qfit pdbs encode altlocs in delta form: the blank altloc holds
+        # shared atoms (typically backbone) and named altlocs A/B/C only
+        # carry the atoms that genuinely differ between conformers. only fall
+        # back to the blank altloc here, never to another named altloc, so
+        # we never silently mix atoms from conformer A into conformer B's chi.
+        # ~28% of recorded chi values were previously contaminated this way.
+        blank = altlocs.get(" ", {})
         def get(name):
             if name in atoms:
                 return atoms[name][0]
-            return get_xyz(altlocs, name)
+            if name in blank:
+                return blank[name][0]
+            return None
 
         for ci, (a1n, a2n, a3n, a4n) in enumerate(chi_defs):
             p1, p2, p3, p4 = get(a1n), get(a2n), get(a3n), get(a4n)
