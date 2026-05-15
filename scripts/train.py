@@ -50,8 +50,10 @@ def run_train(args):
     model = qFitLatent(
         d_single=args.d_single,
         d_pair=args.d_pair,
+        n_ipa=args.n_ipa,
         n_heads=args.n_heads,
         c=args.c,
+        k=args.k,
         dropout=args.dropout,
     )
     print(f"params: {sum(p.numel() for p in model.parameters()):,}")
@@ -111,12 +113,9 @@ def main() -> None:
     p.add_argument("--d_pair", type=int, default=32)
     p.add_argument("--n_heads", type=int, default=4)
     p.add_argument("--c", type=int, default=8)
-    p.add_argument(
-        "--dropout",
-        type=float,
-        default=0.2,
-        help="Dropout probability applied after IPA and FFN in each block",
-    )
+    p.add_argument("--n_ipa", type=int, default=8)
+    p.add_argument("--k", type=int, default=5)
+    p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--save_every", type=int, default=10)
     p.add_argument("--checkpoint_dir", default="checkpoints/test")
     p.add_argument("--loss_csv", default="logs/test_loss.csv")
