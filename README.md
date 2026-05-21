@@ -22,15 +22,15 @@ so that $R_i = [\hat{x} \; \hat{y} \; \hat{z}]$ is a proper orthonormal frame th
 
 ### Output head
 
-The final single representation $s_i$ is projected to a $k$-component Gaussian mixture over sidechain $\chi$ angles:
+The final single representation $s_i$ is projected to a $k$-component **von Mises mixture** over sidechain $\chi$ angles:
 
 $$\pi_i = \mathrm{softmax}(W_\pi\, s_i)$$
 
-$$\mu_{ik} = W_\mu\, s_i \in \mathbb{R}^{D_\chi}$$
+$$\mu_{ik} = \pi \tanh(W_\mu\, s_i) \in (-\pi, \pi]^{D_\chi}$$
 
-$$\sigma_{ik} = \mathrm{softplus}(W_\sigma\, s_i) + \sigma_{\min} \in \mathbb{R}_{>0}^{D_\chi}$$
+$$\kappa_{ik} = \mathrm{softplus}(W_\kappa\, s_i) + \kappa_{\min} \in \mathbb{R}_{>0}^{D_\chi}$$
 
-with $D_\chi = 4$ ($\chi_1, \chi_2, \chi_3, \chi_4$), $k = 5$ mixture components.
+with $D_\chi = 4$ ($\chi_1, \chi_2, \chi_3, \chi_4$). Each component $k$ places a von Mises distribution on every $\chi$ angle: a mean direction $\mu_{ik}$ (the projection is passed through $\tanh$ and scaled to bound it to a full turn) and a concentration $\kappa_{ik}$ — the circular analogue of inverse variance ($\kappa \to 0$ is uniform on the circle, large $\kappa$ is sharply peaked). The von Mises mixture replaces an earlier wrapped-Gaussian formulation, removing the variance-floor hack and giving a properly normalized density on the torus.
 
 ---
 
@@ -38,27 +38,22 @@ with $D_\chi = 4$ ($\chi_1, \chi_2, \chi_3, \chi_4$), $k = 5$ mixture components
 
 **Data.** qFit multiconformer PDB files. Named altlocs (A, B, $\ldots$) with crystallographic occupancies provide the discrete ground-truth ensemble; the blank altloc provides the input backbone frame.
 
-**Loss.** Occupancy-weighted negative log-likelihood of observed altloc $\chi$ angles under the predicted mixture:
+**Loss.** Occupancy-weighted negative log-likelihood of the observed altloc $\chi$ angles under the predicted von Mises mixture. For a single residue with $A$ observed altlocs:
 
-$$\mathcal{L} = -\frac{1}{|\mathcal{R}|} \sum_{i \in \mathcal{R}} \sum_{a} w_{ia} \log \sum_{k=1}^{K} \pi_{ik} \prod_{j=1}^{D_\chi} m_{ij}\, \mathcal{N}_{\mathrm{circ}}\bigl( \chi_{iaj};\, \mu_{ikj},\, \sigma_{ikj}^{2} \bigr)$$
+$$\mathcal{L} = - \sum_{a=1}^{A} o_a \log \left[ \sum_{k=1}^{K} \pi_k \prod_{d=1}^{D} \frac{1}{2\pi I_0(\kappa_{dk})} \exp\left( \kappa_{dk}\cos(\chi_{ad}-\chi_{dk}) \right) \right]$$
+
+The training loss is this quantity averaged over the valid residue set $\mathcal{R}$.
 
 where:
 
 - $\mathcal{R} = \{ i : n_{\mathrm{obs},i} \geq 2 \text{ and } d_{\mathrm{eff},i} \geq 1 \}$ is the set of residues with at least two observed altlocs and at least one defined $\chi$ angle.
-- $w_{ia} = \mathrm{occ}_{ia} / \sum_{a'} \mathrm{occ}_{ia'}$ are normalized occupancy weights.
-- $m_{ij} \in \{0, 1\}$ is the chi-validity mask.
-- $\mathcal{N}_{\mathrm{circ}}$ uses a wrapped Gaussian on the circle. Residual errors are wrapped to $(-\pi, \pi]$ via $\mathrm{atan2}(\sin \Delta, \cos \Delta)$. For chi angles with $\pi$-rotational symmetry (ASP $\chi_2$, GLU $\chi_3$, PHE $\chi_2$, TYR $\chi_2$), errors are folded to $(-\pi/2, \pi/2]$ via $\tfrac{1}{2}\, \mathrm{atan2}(\sin 2\Delta, \cos 2\Delta)$.
+- $o_a$ is the crystallographic occupancy of altloc $a$, normalized so $\sum_a o_a = 1$.
+- $\pi_k$ and $\kappa_{dk}$ are the predicted mixture weight and concentration; $\chi_{dk} \equiv \mu_{kd}$ is the predicted von Mises mean direction of component $k$ on $\chi$ angle $d$; $\chi_{ad}$ is the observed angle of altloc $a$.
+- $D$ is the number of defined $\chi$ angles for the residue (i.e. the per-$\chi$ validity mask restricts the product), and $K$ the number of mixture components.
+- $\frac{1}{2\pi I_0(\kappa)} \exp(\kappa \cos \Delta)$ is the von Mises density on the circle, with $I_0$ the modified Bessel function of the first kind, order $0$. The log-normalizer is evaluated stably as $\log I_0(\kappa) = \log\,\mathrm{i0e}(\kappa) + \kappa$ (`torch.special.i0e`), so large $\kappa$ stays finite.
+- The residual $\Delta = \chi_{ad}-\chi_{dk}$ is taken on the circle. For $\chi$ angles with $\pi$-rotational symmetry (ASP $\chi_2$, GLU $\chi_3$, PHE $\chi_2$, TYR $\chi_2$) it is folded to $(-\pi/2, \pi/2]$ via $\tfrac{1}{2}\, \mathrm{atan2}(\sin 2\Delta, \cos 2\Delta)$.
 
 **Optimization.** AdamW with $\eta = 3 \times 10^{-4}$, cosine annealing to $\eta / 100$ over the full training run. Batch size 1 (one full protein per step).
-
----
-
-## Validation
-
-`validation/validate.py` runs inference on a train and a val structure and produces:
-
-- A predicted multiconformer PDB with GMM component means written as altlocs (for PyMOL overlay).
-- A per-structure figure showing per-residue loss and RMSF, observed vs predicted per-atom RMSF, and observed RMSF vs predicted $\sigma_k$.
 
 ---
 
@@ -73,9 +68,9 @@ where:
 | head dim | $c$ | $8$ |
 | query/key points | $N_{qk}$ | $4$ |
 | value points | $N_v$ | $8$ |
-| GMM components | $k$ | $5$ |
+| von Mises components | $k$ | $5$ |
 | chi dimensions | $D_\chi$ | $4$ |
-| sigma floor | $\sigma_{\min}$ | $0.3$ rad |
+| concentration floor | $\kappa_{\min}$ | $0.01$ |
 | dropout | $p$ | $0.2$ |
 | optimizer | --- | AdamW |
 | learning rate | $\eta$ | $3 \times 10^{-4}$ |
