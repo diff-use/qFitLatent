@@ -262,13 +262,13 @@ def load_model(ckpt_path: Path, device: str) -> qFitLatent:
 def run_inference(
     model: qFitLatent, sample: dict, device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward pass; returns (pi, mu, sigma) on CPU."""
-    pi, mu, sigma = model(
+    """Forward pass; returns (pi, mu, kappa) on CPU."""
+    pi, mu, kappa = model(
         sample["aa_tokens"].to(device),
         sample["R"].to(device),
         sample["t"].to(device),
     )
-    return pi.cpu(), mu.cpu(), sigma.cpu()
+    return pi.cpu(), mu.cpu(), kappa.cpu()
 
 
 # ── PDB output ─────────────────────────────────────────────────────────────────
@@ -283,7 +283,7 @@ def write_predicted_pdb(
     sample: dict,
     pi: torch.Tensor,
     mu: torch.Tensor,
-    sigma: torch.Tensor,
+    kappa: torch.Tensor,
     pi_thresh: float = 0.10,
 ) -> None:
     """
@@ -333,7 +333,8 @@ def write_predicted_pdb(
             occ        = float(weights[k_comp])
             chi_angles = mu[i, k_comp].numpy()   # (N_CHI,)
             
-            _sig = sigma[i, k_comp]
+            # kappa -> approx circular std (radians) for the b-factor column
+            _sig = kappa[i, k_comp].clamp(min=1e-3).rsqrt()
             comp_sigma = float(_sig.mean()) if _sig.numel() > 1 else float(_sig)
 
             placed = reconstruct_sidechain(resname, chi_angles, bb_atoms)
@@ -376,10 +377,10 @@ def main():
     if sample is None:
         print("failed to parse PDB"); return
 
-    pi, mu, sigma = run_inference(model, sample, device)
+    pi, mu, kappa = run_inference(model, sample, device)
 
     out = args.out or args.pdb.parent / f"{args.pdb.stem}_predicted.pdb"
-    write_predicted_pdb(out, args.pdb, sample, pi, mu, sigma, pi_thresh=args.thresh)
+    write_predicted_pdb(out, args.pdb, sample, pi, mu, kappa, pi_thresh=args.thresh)
     print(f"wrote → {out}  ({pi.shape[0]} residues)")
 
 

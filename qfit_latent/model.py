@@ -12,8 +12,8 @@ import math
 from .data.data import N_CHI, N_CHI_PER_AA
 
 # global parameters
-# minimum variance allowed to prevent sigma collapse
-SIG_FLOOR = 0.15
+# minimum von mises concentration to keep kappa > 0 and i0e well behaved
+KAPPA_MIN = 1e-2
 
 class qFitLatent(nn.Module):
     ''' 
@@ -28,7 +28,7 @@ class qFitLatent(nn.Module):
     Outputs:
         pi: (N, k)
         mu: (N, k, d_chi)
-        sigma: (N, k, d_chi)
+        kappa: (N, k, d_chi)
     '''
 
     # initialize with hyperparams
@@ -125,26 +125,26 @@ class qFitLatent(nn.Module):
                 s, z = block(s, z, R, t)
         
         chi_mask = self.chi_mask(aa_tokens)
-        return self.chigmm_head(s, chi_mask) # pi [N,k], mu [N, k, N_CHI], sigma [N, k, N_CHI]
+        return self.chigmm_head(s, chi_mask) # pi [N,k], mu [N, k, N_CHI], kappa [N, k, N_CHI]
 
 
 class ChiGMMHead(nn.Module):
     '''
-    This is the readout layer for the qfit latent dynamics GMM
-    model. It takes a hidden representation [N, d_single] and 
-    predicts k gaussian components to represent the distribution
-    of residue rotamers as a gaussian misxture.
+    This is the readout layer for the qfit latent dynamics mixture
+    model. It takes a hidden representation [N, d_single] and
+    predicts k von mises components to represent the distribution
+    of residue rotamers as a circular mixture on the torus.
 
-    p(𝝌 | h) = Sum(k<K) pi_k * 𝒩(𝝌 | mu_k, sigma_k^2)
+    p(𝝌 | h) = Sum(k<K) pi_k * vM(𝝌 | mu_k, kappa_k)
 
     Inputs:
         - h: [N, d_single] learned representation from IPA blocks
         - k: number of components
-    
+
     Outputs:
         - pi: [N, k] predicted weights for each component
-        - mu: [N, k * d_chi] predicted average chi angles per component
-        - sigma: [N, k * d_chi] predicted variance per chi angle per component
+        - mu: [N, k * d_chi] predicted mean chi angle per component
+        - kappa: [N, k * d_chi] predicted concentration per chi angle per component
     '''
     def __init__(self, d_single, k = 5, d_chi = N_CHI):
         super().__init__() # inherit module
@@ -155,7 +155,7 @@ class ChiGMMHead(nn.Module):
         # the output layers
         self.pi_proj = nn.Linear(d_single, k)
         self.mu_proj = nn.Linear(d_single, k*d_chi)
-        self.sigma_proj = nn.Linear(d_single, k*d_chi)
+        self.kappa_proj = nn.Linear(d_single, k*d_chi)
 
     # forward pass for learning and prediction
     def forward(self, h, chi_mask=None):
@@ -164,14 +164,15 @@ class ChiGMMHead(nn.Module):
         pi = torch.softmax(self.pi_proj(h).float(), dim=-1)
         # wrap the prediction of chi angles to the circle
         mu    = math.pi * torch.tanh(self.mu_proj(h).float()).view(*batch, k, d)
-        sigma = F.softplus(self.sigma_proj(h)).float().view(*batch, k, d) + SIG_FLOOR
+        # concentration: softplus keeps kappa > 0, floor avoids the uniform limit
+        kappa = F.softplus(self.kappa_proj(h)).float().view(*batch, k, d) + KAPPA_MIN
         # apply chi mask to hide chi angles that dont exist in residues
         if chi_mask is not None:
-            m     = chi_mask[..., None, :]              
+            m     = chi_mask[..., None, :]
             mu    = mu * m.to(mu.dtype)
-            sigma = torch.where(m, sigma, torch.ones_like(sigma))
+            kappa = torch.where(m, kappa, torch.ones_like(kappa))
 
-        return pi, mu, sigma
+        return pi, mu, kappa
     
 class IPA(nn.Module):
     '''

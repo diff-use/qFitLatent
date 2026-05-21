@@ -4,27 +4,29 @@ The loss function for learning qfit latent dynamics through
 ground truth multiconformer models refit to better match electron density. 
 The model learns a probaility density function for each residue in a protein
 from the backbone structure and its sequence. Each residue is treated like a
-gaussian mixture model in torsional space.
+von mises mixture model in torsional space.
 '''
 
 import torch.nn as nn
 import torch
 import math
 
+from .data.data import N_CHI_PER_AA
+
 class ChiGMMLoss(nn.Module):
     '''
     Weighted negative log likelihood of observed chi angles in the ground truth
-    qfit multiconformer model. Gaussian mixture is defined over the torsion 
-    space with up to k components per residue. 
+    qfit multiconformer model. A von mises mixture is defined over the torsion
+    space with up to k components per residue.
 
     Averaged over residies for a altlocs and k components and j chi angles:
-    L = -mean (residues) Sum(a) w_a log Sum(k) π_k ∀j N_circ(χ_aj ; mu_kj, sigma_kj^2)
+    L = -mean (residues) Sum(a) w_a log Sum(k) π_k ∀j vM(χ_aj ; mu_kj, kappa_kj)
     '''
     def forward(
         self,
-        pi, 
+        pi,
         mu,
-        sigma, 
+        kappa,
         qfit_chis,
         occupancies,
         mask,
@@ -67,16 +69,17 @@ class ChiGMMLoss(nn.Module):
         # reshape the mask to broadcast over the m/k pairs
         mask_f = mask[:, None, None, :].float()
 
-        # precompute constants for the gaussian term(s)
-        sigma2 = sigma.float().pow(2).clamp(min=1e-6)
-        log_sigma2 = sigma2.log()
-        log2pi = math.log(2*math.pi)  
+        # von mises log normaliser via the exponentially scaled bessel i0e so
+        # large kappa stays finite: log I0(k) = log(i0e(k)) + k
+        kap = kappa.float().clamp(min=1e-6)
+        log2pi = math.log(2*math.pi)
+        log_norm_const = log2pi + kap + torch.special.i0e(kap).log()
 
-        # evaluate each altloc under each component for each residue and chi ang
-        per_dim = (log2pi + log_sigma2[:, None, :, :]
-                   + error.pow(2) / sigma2[:, None, :, :])
+        # von mises log density per altloc/component/chi: k*cos(Δ) - log(2π I0)
+        per_dim = (kap[:, None, :, :] * torch.cos(error)
+                   - log_norm_const[:, None, :, :])
         # multiply by mask and sum over chi dimensions
-        log_norm = -0.5 * (per_dim * mask_f).sum(-1)
+        log_norm = (per_dim * mask_f).sum(-1)
         # multiply the component loss by the log of component weight
         log_pi = pi.float().clamp(min=1e-8).log()
         # stay in log space when summing to prevent underflow
@@ -98,8 +101,7 @@ class ChiGMMLoss(nn.Module):
 def wrap_2pi(x):
     return torch.atan2(torch.sin(x), torch.cos(x))
 
-# some residues (PHE, etc.) are symmetric about pi for a given angle 
+# some residues (PHE, etc.) are symmetric about pi for a given angle
 def wrap_pi(x):
     return 0.5 * torch.atan2(torch.sin(2.0 * x), torch.cos(2.0 * x))
-        
-    
+

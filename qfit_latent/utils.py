@@ -55,11 +55,10 @@ def run_epoch(
         sym_mask = sym_tbl[aa]
 
         with torch.set_grad_enabled(training):
-            pi, mu, sigma = model(aa, R, t)
+            pi, mu, kappa = model(aa, R, t)
 
-            # calculate loss
             out = loss_function(
-                pi, mu, sigma, 
+                pi, mu, kappa,
                 chi_angles, occupancies, chi_mask, sym_mask
             )
             loss = out["loss"]
