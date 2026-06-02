@@ -1,10 +1,11 @@
-from .model import qFitLatent, ChiGMMHead
+from .model import qFitLatent, ChiARHead
 from .data.data import build_frame, N_CHI
-from .loss import ChiGMMLoss
+from .loss import ChiARLoss
 
 __all__ = [
     "qFitLatent",
-    "ChiGMMLoss",
-    "build_frames",
+    "ChiARHead",
+    "ChiARLoss",
+    "build_frame",
     "N_CHI",
 ]

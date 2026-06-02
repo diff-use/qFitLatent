@@ -13,14 +13,27 @@ import math
 
 from .data.data import N_CHI_PER_AA
 
-class ChiGMMLoss(nn.Module):
+class ChiARLoss(nn.Module):
     '''
-    Weighted negative log likelihood of observed chi angles in the ground truth
-    qfit multiconformer model. A von mises mixture is defined over the torsion
-    space with up to k components per residue.
+    Autoregressive negative log-likelihood for the chi-angle von mises mixture.
+    Each chi dim d has its own k-component conditional mixture (parameters
+    depend on the observed chi_<d via teacher forcing through the AR head).
+    The joint log-prob factorises as a sum of per-chi conditional log-probs,
+    so the loss is just per-chi vM mixture NLL summed over chi:
 
-    Averaged over residies for a altlocs and k components and j chi angles:
-    L = -mean (residues) Sum(a) w_a log Sum(k) π_k ∀j vM(χ_aj ; mu_kj, kappa_kj)
+        L = -mean (residues) Sum(a) w_a Sum(d) log Sum(k) π_dk · vM(χ_a,d ; μ_dk, κ_dk)
+
+    where (π_dk, μ_dk, κ_dk) at chi d depend on chi_<d. This is the AR
+    replacement for the factorised-product vM NLL — each rotameric mode is a
+    sequence of component choices, so the model can natively express joint
+    coupling on the multi-modal residues (ARG / LYS / aromatic).
+
+    Inputs (broadcast over the altloc axis A from the AR head):
+        pi, mu, kappa: [N, A, D, k]
+        qfit_chis:     [N, A, D]
+        occupancies:   [N, A]
+        mask:          [N, D]    (per-residue chi validity)
+        symmetry_mask: [N, D]    (π-symmetric chis: ASP χ2 etc.)
     '''
     def forward(
         self,
@@ -32,68 +45,57 @@ class ChiGMMLoss(nn.Module):
         mask,
         symmetry_mask
     ):
-        N, k, D = mu.shape
+        N, A, D, k = mu.shape
         device = mu.device
 
-        # masks for valid reisdues 
-        n_obs = (occupancies > 0).sum(-1) # number of qfit altlocs that were observed
-        d_eff = mask.float().sum(-1) # number of chi angles that are observed 
-        # valid if it has observed occupancy & a chi angle
+        # masks for valid residues
+        n_obs = (occupancies > 0).sum(-1)           # observed altloc count
+        d_eff = mask.float().sum(-1)                # observed chi count
         valid_res = (n_obs >= 2) & (d_eff >= 1)
 
-        # set up the loss dict which also sums per residue and per chi angle
         out = {
             "loss": pi.new_zeros(()),
             "per_residue_loss": torch.full((N,), float("nan"), device=device),
-            "per_chi_loss": torch.full((N, D), float("nan"), device=device)
+            "per_chi_loss": torch.full((N, D), float("nan"), device=device),
         }
-
-        # if no valid residues, return default loss
         if not valid_res.any():
             return out
-        
-        # get the per chi angle losses as raw radians 
-        error = qfit_chis[:, :, None, :].float() - mu[:, None, :, :].float()
-        # wrap the radian errors around the 2pi circle
-        error_2pi = wrap_2pi(error)
 
+        # residual per (altloc, chi, component)
+        # qfit_chis: [N, A, D] -> [N, A, D, 1] ; mu: [N, A, D, k]
+        error = qfit_chis.unsqueeze(-1).float() - mu.float()
+        error_2pi = wrap_2pi(error)
         if symmetry_mask is not None and symmetry_mask.any():
-            # wrap distances to pi and return the wrapped those for sym residues
             error_pi = wrap_pi(error)
-            sm = symmetry_mask[:, None, None, :].to(torch.bool)
-            # pi wrapped for pi sym residue/angles 2pi wrapped for all else
+            sm = symmetry_mask[:, None, :, None].to(torch.bool)   # [N,1,D,1]
             error = torch.where(sm, error_pi, error_2pi)
-        else: # otherwise all 2pi wrapped
+        else:
             error = error_2pi
 
-        # reshape the mask to broadcast over the m/k pairs
-        mask_f = mask[:, None, None, :].float()
-
-        # von mises log normaliser via the exponentially scaled bessel i0e so
-        # large kappa stays finite: log I0(k) = log(i0e(k)) + k
+        # von mises log density per (altloc, chi, component); stable via i0e
         kap = kappa.float().clamp(min=1e-6)
         log2pi = math.log(2*math.pi)
         log_norm_const = log2pi + kap + torch.special.i0e(kap).log()
+        log_vm = kap * torch.cos(error) - log_norm_const          # [N,A,D,k]
 
-        # von mises log density per altloc/component/chi: k*cos(Δ) - log(2π I0)
-        per_dim = (kap[:, None, :, :] * torch.cos(error)
-                   - log_norm_const[:, None, :, :])
-        # multiply by mask and sum over chi dimensions
-        log_norm = (per_dim * mask_f).sum(-1)
-        # multiply the component loss by the log of component weight
-        log_pi = pi.float().clamp(min=1e-8).log()
-        # stay in log space when summing to prevent underflow
-        log_p = torch.logsumexp(log_pi[:, None, :] + log_norm, dim=-1)
+        # mixture log-prob per (altloc, chi): logsumexp over components k
+        log_pi = pi.float().clamp(min=1e-8).log()                 # [N,A,D,k]
+        log_p_chi = torch.logsumexp(log_pi + log_vm, dim=-1)      # [N,A,D]
 
-        # weight the term losses per occupancies (normalize first) and sum to be
-        # per residue
-        obs_mask = occupancies > 0 # get valid altloc spots
+        # mask out chi dims that dont exist in this residue
+        mask_f = mask[:, None, :].float()                         # [N,1,D]
+        log_p_chi = log_p_chi * mask_f
+
+        # autoregressive joint log-prob per altloc: sum over chi
+        log_p_alt = log_p_chi.sum(-1)                             # [N, A]
+
+        # weight by normalised occupancy, sum over altlocs -> per-residue NLL
+        obs_mask = (occupancies > 0).float()
         occ_norm = occupancies / occupancies.sum(-1, keepdim=True).clamp(min=1e-8)
-        log_prob = -(occ_norm * log_p * obs_mask).sum(-1) # [N] total loss per res
+        nll_per_res = -(occ_norm * log_p_alt * obs_mask).sum(-1)  # [N]
 
-        # get total loss per residue type and per protein
-        out["loss"] = log_prob[valid_res].mean()
-        out["per_residue_loss"][valid_res] = log_prob[valid_res]
+        out["loss"] = nll_per_res[valid_res].mean()
+        out["per_residue_loss"][valid_res] = nll_per_res[valid_res].detach()
 
         return out
     
