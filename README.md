@@ -22,11 +22,11 @@ so that $R_i = [\hat{x} \; \hat{y} \; \hat{z}]$ is a proper orthonormal frame th
 
 ### Output head (autoregressive von Mises mixture)
 
-The final single representation $s_i$ conditions an **autoregressive** chain over the four sidechain $\chi$ angles. Each $\chi_d$ has its own $k$-component von Mises mixture whose parameters depend on $s_i$ **and** the previous angles $\chi_{<d}$ (fed in as $\sin/\cos$ features):
+The final single representation $s_i$ conditions an **autoregressive** chain over the four sidechain $\chi$ angles. Each $\chi_d$ has its own $k$-component von Mises mixture whose parameters depend on $s_i$ **and** the previous angles $\chi_{\lt d}$ (fed in as $\sin/\cos$ features):
 
-$$p(\chi_i \mid s_i) = \prod_{d=1}^{D_\chi} \sum_{k=1}^{K} \pi_{dk}(s_i, \chi_{<d})\; \mathrm{vM}\!\left(\chi_d \mid \mu_{dk}, \kappa_{dk}\right)$$
+$$p(\chi_i \mid s_i) = \prod_{d=1}^{D_\chi} \sum_{k=1}^{K} \pi_{dk}(s_i, \chi_{\lt d})\; \mathrm{vM}\!\left(\chi_d \mid \mu_{dk}, \kappa_{dk}\right)$$
 
-with $D_\chi = 4$ and, per head, $\pi = \mathrm{softmax}(\cdot)$, $\mu = \pi\tanh(\cdot) \in (-\pi, \pi]$, $\kappa = \mathrm{softplus}(\cdot) + \kappa_{\min} > 0$ (the circular analogue of inverse variance). A single rotameric mode is therefore a *sequence* of component choices $(k_1, \ldots, k_4)$, so one mode can natively express correlated $\chi$ (e.g. ARG $g^+/g^+/t/g^+$) — unlike the earlier factorised mixture, whose components used independent per-$\chi$ parameters. The von Mises form (replacing an earlier wrapped Gaussian) removes the variance-floor hack and gives a properly normalized density on the torus.
+with $D_\chi = 4$ and, per head, $\pi = \mathrm{softmax}(\cdot)$, $\mu = \pi\tanh(\cdot) \in (-\pi, \pi]$, $\kappa = \mathrm{softplus}(\cdot) + \kappa_{\min} \gt 0$ (the circular analogue of inverse variance). A single rotameric mode is therefore a *sequence* of component choices $(k_1, \ldots, k_4)$, so one mode can natively express correlated $\chi$ (e.g. ARG $g^+/g^+/t/g^+$) — unlike the earlier factorised mixture, whose components used independent per-$\chi$ parameters. The von Mises form (replacing an earlier wrapped Gaussian) removes the variance-floor hack and gives a properly normalized density on the torus.
 
 ---
 
@@ -34,9 +34,9 @@ with $D_\chi = 4$ and, per head, $\pi = \mathrm{softmax}(\cdot)$, $\mu = \pi\tan
 
 **Data.** qFit multiconformer PDB files. Named altlocs (A, B, $\ldots$) with crystallographic occupancies provide the discrete ground-truth ensemble; the blank altloc provides the input backbone frame.
 
-**Loss.** Occupancy-weighted negative log-likelihood of the observed altloc $\chi$ angles, with the density factored autoregressively and **teacher-forced**: the conditioning $\chi_{a,<d}$ at step $d$ uses altloc $a$'s own observed earlier angles. For a single residue with $A$ observed altlocs:
+**Loss.** Occupancy-weighted negative log-likelihood of the observed altloc $\chi$ angles, with the density factored autoregressively and **teacher-forced**: the conditioning $\chi_{a,\lt d}$ at step $d$ uses altloc $a$'s own observed earlier angles. For a single residue with $A$ observed altlocs:
 
-$$\mathcal{L} = - \sum_{a=1}^{A} o_a \sum_{d=1}^{D} \log \sum_{k=1}^{K} \pi_{dk}(\chi_{a,<d})\, \mathrm{vM}\!\left(\chi_{ad} \mid \mu_{dk}, \kappa_{dk}\right), \qquad \mathrm{vM}(\chi \mid \mu, \kappa) = \frac{\exp(\kappa \cos(\chi - \mu))}{2\pi I_0(\kappa)}$$
+$$\mathcal{L} = - \sum_{a=1}^{A} o_a \sum_{d=1}^{D} \log \sum_{k=1}^{K} \pi_{dk}(\chi_{a,\lt d})\, \mathrm{vM}\!\left(\chi_{ad} \mid \mu_{dk}, \kappa_{dk}\right), \qquad \mathrm{vM}(\chi \mid \mu, \kappa) = \frac{\exp(\kappa \cos(\chi - \mu))}{2\pi I_0(\kappa)}$$
 
 averaged over the valid residue set $\mathcal{R} = \{ i : n_{\mathrm{obs},i} \geq 2,\ d_{\mathrm{eff},i} \geq 1 \}$ (at least two observed altlocs and one defined $\chi$). Here $o_a$ is the normalized occupancy ($\sum_a o_a = 1$), $D$ the number of defined $\chi$ for the residue (per-$\chi$ validity mask), and $I_0$ the order-0 modified Bessel function — its log-normalizer is evaluated stably as $\log I_0(\kappa) = \log\,\mathrm{i0e}(\kappa) + \kappa$ (`torch.special.i0e`). The residual $\chi_{ad} - \mu_{dk}$ is taken on the circle; for $\pi$-symmetric $\chi$ (ASP $\chi_2$, GLU $\chi_3$, PHE $\chi_2$, TYR $\chi_2$) it is folded to $(-\pi/2, \pi/2]$ via $\tfrac{1}{2}\,\mathrm{atan2}(\sin 2\Delta, \cos 2\Delta)$.
 
