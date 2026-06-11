@@ -20,17 +20,13 @@ $$\hat{x} = \frac{C - C_\alpha}{\| C - C_\alpha \|}, \quad \hat{z} = \frac{\hat{
 
 so that $R_i = [\hat{x} \; \hat{y} \; \hat{z}]$ is a proper orthonormal frame that puts the $C_\alpha$ at the origin, the $C$ along the positive x-axis, and the $N$ in the xy-plane with positive y.
 
-### Output head
+### Output head (autoregressive von Mises mixture)
 
-The final single representation $s_i$ is projected to a $k$-component **von Mises mixture** over sidechain $\chi$ angles:
+The final single representation $s_i$ conditions an **autoregressive** chain over the four sidechain $\chi$ angles. Each $\chi_d$ has its own $k$-component von Mises mixture whose parameters depend on $s_i$ **and** the previous angles $\chi_{<d}$ (fed in as $\sin/\cos$ features):
 
-$$\pi_i = \mathrm{softmax}(W_\pi\, s_i)$$
+$$p(\chi_i \mid s_i) = \prod_{d=1}^{D_\chi} \sum_{k=1}^{K} \pi_{dk}(s_i, \chi_{<d})\; \mathrm{vM}\!\left(\chi_d \mid \mu_{dk}, \kappa_{dk}\right)$$
 
-$$\mu_{ik} = \pi \tanh(W_\mu\, s_i) \in (-\pi, \pi]^{D_\chi}$$
-
-$$\kappa_{ik} = \mathrm{softplus}(W_\kappa\, s_i) + \kappa_{\min} \in \mathbb{R}_{>0}^{D_\chi}$$
-
-with $D_\chi = 4$ ($\chi_1, \chi_2, \chi_3, \chi_4$). Each component $k$ places a von Mises distribution on every $\chi$ angle: a mean direction $\mu_{ik}$ (the projection is passed through $\tanh$ and scaled to bound it to a full turn) and a concentration $\kappa_{ik}$ — the circular analogue of inverse variance ($\kappa \to 0$ is uniform on the circle, large $\kappa$ is sharply peaked). The von Mises mixture replaces an earlier wrapped-Gaussian formulation, removing the variance-floor hack and giving a properly normalized density on the torus.
+with $D_\chi = 4$ and, per head, $\pi = \mathrm{softmax}(\cdot)$, $\mu = \pi\tanh(\cdot) \in (-\pi, \pi]$, $\kappa = \mathrm{softplus}(\cdot) + \kappa_{\min} > 0$ (the circular analogue of inverse variance). A single rotameric mode is therefore a *sequence* of component choices $(k_1, \ldots, k_4)$, so one mode can natively express correlated $\chi$ (e.g. ARG $g^+/g^+/t/g^+$) — unlike the earlier factorised mixture, whose components used independent per-$\chi$ parameters. The von Mises form (replacing an earlier wrapped Gaussian) removes the variance-floor hack and gives a properly normalized density on the torus.
 
 ---
 
@@ -38,22 +34,31 @@ with $D_\chi = 4$ ($\chi_1, \chi_2, \chi_3, \chi_4$). Each component $k$ places 
 
 **Data.** qFit multiconformer PDB files. Named altlocs (A, B, $\ldots$) with crystallographic occupancies provide the discrete ground-truth ensemble; the blank altloc provides the input backbone frame.
 
-**Loss.** Occupancy-weighted negative log-likelihood of the observed altloc $\chi$ angles under the predicted von Mises mixture. For a single residue with $A$ observed altlocs:
+**Loss.** Occupancy-weighted negative log-likelihood of the observed altloc $\chi$ angles, with the density factored autoregressively and **teacher-forced**: the conditioning $\chi_{a,<d}$ at step $d$ uses altloc $a$'s own observed earlier angles. For a single residue with $A$ observed altlocs:
 
-$$\mathcal{L} = - \sum_{a=1}^{A} o_a \log \left[ \sum_{k=1}^{K} \pi_k \prod_{d=1}^{D} \frac{1}{2\pi I_0(\kappa_{dk})} \exp\left( \kappa_{dk}\cos(\chi_{ad}-\chi_{dk}) \right) \right]$$
+$$\mathcal{L} = - \sum_{a=1}^{A} o_a \sum_{d=1}^{D} \log \sum_{k=1}^{K} \pi_{dk}(\chi_{a,<d})\, \mathrm{vM}\!\left(\chi_{ad} \mid \mu_{dk}, \kappa_{dk}\right), \qquad \mathrm{vM}(\chi \mid \mu, \kappa) = \frac{\exp(\kappa \cos(\chi - \mu))}{2\pi I_0(\kappa)}$$
 
-The training loss is this quantity averaged over the valid residue set $\mathcal{R}$.
-
-where:
-
-- $\mathcal{R} = \{ i : n_{\mathrm{obs},i} \geq 2 \text{ and } d_{\mathrm{eff},i} \geq 1 \}$ is the set of residues with at least two observed altlocs and at least one defined $\chi$ angle.
-- $o_a$ is the crystallographic occupancy of altloc $a$, normalized so $\sum_a o_a = 1$.
-- $\pi_k$ and $\kappa_{dk}$ are the predicted mixture weight and concentration; $\chi_{dk} \equiv \mu_{kd}$ is the predicted von Mises mean direction of component $k$ on $\chi$ angle $d$; $\chi_{ad}$ is the observed angle of altloc $a$.
-- $D$ is the number of defined $\chi$ angles for the residue (i.e. the per-$\chi$ validity mask restricts the product), and $K$ the number of mixture components.
-- $\frac{1}{2\pi I_0(\kappa)} \exp(\kappa \cos \Delta)$ is the von Mises density on the circle, with $I_0$ the modified Bessel function of the first kind, order $0$. The log-normalizer is evaluated stably as $\log I_0(\kappa) = \log\,\mathrm{i0e}(\kappa) + \kappa$ (`torch.special.i0e`), so large $\kappa$ stays finite.
-- The residual $\Delta = \chi_{ad}-\chi_{dk}$ is taken on the circle. For $\chi$ angles with $\pi$-rotational symmetry (ASP $\chi_2$, GLU $\chi_3$, PHE $\chi_2$, TYR $\chi_2$) it is folded to $(-\pi/2, \pi/2]$ via $\tfrac{1}{2}\, \mathrm{atan2}(\sin 2\Delta, \cos 2\Delta)$.
+averaged over the valid residue set $\mathcal{R} = \{ i : n_{\mathrm{obs},i} \geq 2,\ d_{\mathrm{eff},i} \geq 1 \}$ (at least two observed altlocs and one defined $\chi$). Here $o_a$ is the normalized occupancy ($\sum_a o_a = 1$), $D$ the number of defined $\chi$ for the residue (per-$\chi$ validity mask), and $I_0$ the order-0 modified Bessel function — its log-normalizer is evaluated stably as $\log I_0(\kappa) = \log\,\mathrm{i0e}(\kappa) + \kappa$ (`torch.special.i0e`). The residual $\chi_{ad} - \mu_{dk}$ is taken on the circle; for $\pi$-symmetric $\chi$ (ASP $\chi_2$, GLU $\chi_3$, PHE $\chi_2$, TYR $\chi_2$) it is folded to $(-\pi/2, \pi/2]$ via $\tfrac{1}{2}\,\mathrm{atan2}(\sin 2\Delta, \cos 2\Delta)$.
 
 **Optimization.** AdamW with $\eta = 3 \times 10^{-4}$, cosine annealing to $\eta / 100$ over the full training run. Batch size 1 (one full protein per step).
+
+---
+
+## Inference
+
+```bash
+python scripts/inference.py --pdb backbone.pdb --ckpt checkpoints/vmm_ar_k8/latest.pt --out pred.pdb
+```
+
+Only the backbone ($N, C_\alpha, C$) and sequence are used, so a **backbone-only PDB is a valid input**. The autoregressive head is unrolled by ancestral beam search to the top-$K$ joint $\chi$ modes; components with mixing weight above `--thresh` (default $0.10$) are written as altlocs A/B/C…, with sidechain atoms rebuilt from the predicted $\chi$ via NeRF. The checkpoint's architecture (including $k$) is inferred on load, so any trained run works. See `qfl_evaluation/benchmark/` for forward-pass latency benchmarking.
+
+### Per-residue embeddings
+
+```bash
+python scripts/extract_embeddings.py --pdb backbone.pdb --ckpt checkpoints/vmm_ar_k8/latest.pt --out emb.npz
+```
+
+Writes the single representation $s_i$ from the final IPA block — the SE(3)-invariant per-residue vector the chi head reads — as an `.npz` with `emb` $[N, d_s]$ plus aligned `chain` / `resseq` / `resname` / `aa_token` arrays. Load with `np.load(..., allow_pickle=True)`.
 
 ---
 

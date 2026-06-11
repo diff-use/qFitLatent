@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 '''
-qFitLatent inference: model loading, chi-angle GMM prediction, and sidechain
-reconstruction via the NeRF (Natural Extension Reference Frame) algorithm.
+qFitLatent inference: model loading, chi-angle von Mises mixture prediction, and
+sidechain reconstruction via the NeRF (Natural Extension Reference Frame)
+algorithm.
 
-Usage (standalone):
-    python inference/inference.py --pdb structures/5v92.pdb
-    python inference/inference.py --pdb structures/5v92.pdb --ckpt checkpoints/epoch_0100.pt
+The model forward pass only needs backbone geometry (N, CA, C → residue frames)
+and the residue identities, so a backbone-only PDB is a valid input; sidechain
+atoms in the input are ignored by the predictor and rebuilt from the predicted
+chi angles. CB is needed only to reconstruct sidechains in the output PDB.
+
+Usage (standalone, from the repo root):
+    python scripts/inference.py --pdb structures/5v92.pdb
+    python scripts/inference.py --pdb structures/5v92.pdb \
+        --ckpt checkpoints/vmm_ar_k8/latest.pt --out out.pdb
+
+Importable API (used by qfl_evaluation/benchmark):
+    load_model(ckpt, device) -> qFitLatent
+    run_inference(model, sample, device) -> (pi, mu, kappa)
 '''
 import argparse, math, sys
 from pathlib import Path
@@ -15,6 +26,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))    # qFitLatent package
+
+DEFAULT_CKPT = ROOT / "checkpoints/vmm_ar_k8/latest.pt"
 
 from qfit_latent.model import qFitLatent
 from qfit_latent.data.data import parse_pdb, get_xyz
@@ -248,27 +261,50 @@ def reconstruct_sidechain(
 # ── model ──────────────────────────────────────────────────────────────────────
 
 def load_model(ckpt_path: Path, device: str) -> qFitLatent:
+    """
+    Rebuild a qFitLatent with the same architecture the checkpoint was trained
+    with. Every shape-determining hyperparameter (single/pair widths, IPA head
+    count, channels-per-head, IPA depth, and the chi-head mixture size k) is
+    inferred from the state dict, so any of the trained runs loads without the
+    caller having to remember its config.
+    """
     sd  = torch.load(ckpt_path, map_location="cpu")["model"]
     d_s = sd["aa_embed.weight"].shape[1]
     d_z = sd["rel_pos_embed.weight"].shape[1]
     H   = sd["ipa_blocks.0.ipa.head_weight"].shape[0]
     c   = sd["ipa_blocks.0.ipa.q_s.weight"].shape[0] // H
-    model = qFitLatent(d_single=d_s, d_pair=d_z, n_heads=H, c=c)
+    # number of IPA blocks = highest ipa_blocks.<i>. index present + 1
+    n_ipa = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("ipa_blocks."))
+    # each chi head's final Linear emits 3*k (pi, mu, kappa per component)
+    k = sd["chi_head.heads.0.2.weight"].shape[0] // 3
+    model = qFitLatent(d_single=d_s, d_pair=d_z, n_heads=H, c=c, n_ipa=n_ipa, k=k)
     model.load_state_dict(sd)
     return model.eval().to(device)
 
 
 @torch.no_grad()
 def run_inference(
-    model: qFitLatent, sample: dict, device: str,
+    model: qFitLatent, sample: dict, device: str, K: int = 8, to_cpu: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward pass; returns (pi, mu, kappa) on CPU."""
+    """
+    Forward pass: returns the predicted per-residue mixture (pi, mu, kappa).
+
+    pi  [N, K]      mixing weights of the top-K joint chi modes
+    mu  [N, K, D]   von Mises means    (D = N_CHI = 4, radians)
+    kappa [N, K, D] von Mises concentrations
+
+    to_cpu=False keeps the result on `device` (useful for benchmarking the GPU
+    forward pass without forcing a device→host copy).
+    """
     pi, mu, kappa = model(
         sample["aa_tokens"].to(device),
         sample["R"].to(device),
         sample["t"].to(device),
+        K=K,
     )
-    return pi.cpu(), mu.cpu(), kappa.cpu()
+    if to_cpu:
+        return pi.cpu(), mu.cpu(), kappa.cpu()
+    return pi, mu, kappa
 
 
 # ── PDB output ─────────────────────────────────────────────────────────────────
@@ -332,7 +368,7 @@ def write_predicted_pdb(
             alt        = chr(ord("A") + rank)
             occ        = float(weights[k_comp])
             chi_angles = mu[i, k_comp].numpy()   # (N_CHI,)
-            
+
             # kappa -> approx circular std (radians) for the b-factor column
             _sig = kappa[i, k_comp].clamp(min=1e-3).rsqrt()
             comp_sigma = float(_sig.mean()) if _sig.numel() > 1 else float(_sig)
@@ -359,17 +395,22 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pdb",    type=Path, required=True,
-                    help="Input qFit multiconformer PDB")
-    ap.add_argument("--ckpt",   type=Path, default=ROOT / "checkpoints/latest.pt")
+                    help="Input PDB (backbone-only is sufficient)")
+    ap.add_argument("--ckpt",   type=Path, default=DEFAULT_CKPT,
+                    help=f"Model checkpoint (default: {DEFAULT_CKPT})")
     ap.add_argument("--out",    type=Path, default=None,
                     help="Output PDB path (default: <pdb_stem>_predicted.pdb)")
     ap.add_argument("--thresh", type=float, default=0.10,
                     help="Min mixing weight to write as altloc (default: 0.10)")
+    ap.add_argument("--K",      type=int, default=8,
+                    help="Number of joint chi modes to predict (default: 8)")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                    help="Torch device (default: cuda if available else cpu)")
     args = ap.parse_args()
 
     from qfit_latent.data.data import ground_truth
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device
     model  = load_model(args.ckpt, device)
     print(f"loaded {args.ckpt.name}  [{device}]")
 
@@ -377,7 +418,7 @@ def main():
     if sample is None:
         print("failed to parse PDB"); return
 
-    pi, mu, kappa = run_inference(model, sample, device)
+    pi, mu, kappa = run_inference(model, sample, device, K=args.K)
 
     out = args.out or args.pdb.parent / f"{args.pdb.stem}_predicted.pdb"
     write_predicted_pdb(out, args.pdb, sample, pi, mu, kappa, pi_thresh=args.thresh)
