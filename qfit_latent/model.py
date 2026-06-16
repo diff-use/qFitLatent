@@ -24,11 +24,13 @@ class qFitLatent(nn.Module):
         - aa_tokens: (N)
         - R: (N, 3, 3)
         - t: (N, 3)
-    
-    Outputs:
-        pi: (N, k)
-        mu: (N, k, d_chi)
-        kappa: (N, k, d_chi)
+        - chi_obs (optional): (N, A, d_chi) observed altloc chi for teacher
+          forcing the autoregressive head during training; if None we run
+          inference-mode beam search
+
+    Outputs (autoregressive head — see ChiARHead):
+        training (chi_obs given):  pi/mu/kappa (N, A, d_chi, k)
+        inference (chi_obs=None):  pi (N, K), mu/kappa (N, K, d_chi)
     '''
 
     # initialize with hyperparams
@@ -77,9 +79,9 @@ class qFitLatent(nn.Module):
             for _ in range(n_ipa)]
         )
 
-        # build the chi angle GMM prediction head (output layer)
-        self.chigmm_head = ChiGMMHead(
-            d_single, 
+        # autoregressive chi-angle vM mixture head (per-chi conditional on chi_<d)
+        self.chi_head = ChiARHead(
+            d_single,
             k=k,
             d_chi=N_CHI,
         )
@@ -110,8 +112,10 @@ class qFitLatent(nn.Module):
         thresholds = torch.arange(N_CHI, device=aa_tokens.device)
         return thresholds[None, :] < counts[aa_tokens, None] # [N, N_CHI] bool
     
-    # a forward pass
-    def forward(self, aa_tokens, R, t):
+    # a forward pass. chi_obs is required for training (teacher-forced AR);
+    # at inference (chi_obs=None) we beam-search ancestrally for the top K
+    # joint modes — same return-shape convention as the old head.
+    def forward(self, aa_tokens, R, t, chi_obs=None, K=8):
         # embed sequence tokens and prepare pair track
         s = self.aa_embed(aa_tokens)
         z = self.pair_init(s, t)
@@ -123,56 +127,150 @@ class qFitLatent(nn.Module):
                 s, z = _checkpoint(block, s, z, R, t, use_reentrant=False)
             else: # forward pass
                 s, z = block(s, z, R, t)
-        
+
         chi_mask = self.chi_mask(aa_tokens)
-        return self.chigmm_head(s, chi_mask) # pi [N,k], mu [N, k, N_CHI], kappa [N, k, N_CHI]
+        if chi_obs is not None:
+            # training: teacher-forced AR -> pi/mu/kappa [N, A, D, k]
+            return self.chi_head(s, chi_obs, chi_mask)
+        # inference: beam search -> pi [N,K], mu/kappa [N, K, D]
+        return self.chi_head.predict(s, chi_mask, K=K)
 
 
-class ChiGMMHead(nn.Module):
+class ChiARHead(nn.Module):
     '''
-    This is the readout layer for the qfit latent dynamics mixture
-    model. It takes a hidden representation [N, d_single] and
-    predicts k von mises components to represent the distribution
-    of residue rotamers as a circular mixture on the torus.
+    Autoregressive von Mises mixture over the four sidechain chi angles.
+    Each chi dim d has its own k-component conditional vM mixture whose
+    parameters depend on the IPA hidden h AND the previous chi values
+    chi_<d via sin/cos features:
 
-    p(𝝌 | h) = Sum(k<K) pi_k * vM(𝝌 | mu_k, kappa_k)
+        p(𝝌 | h) = ∏_d Σ_k π_dk(h, χ_<d) · vM(χ_d | μ_dk, κ_dk)
 
-    Inputs:
-        - h: [N, d_single] learned representation from IPA blocks
-        - k: number of components
+    A single rotameric mode is now a *sequence* of component choices
+    (k_1, k_2, k_3, k_4) — so one mode can natively express correlated
+    chi (e.g. ARG g+/g+/t/g+) instead of the factorised mixture's
+    independent-per-dim within-component restriction. 
 
-    Outputs:
-        - pi: [N, k] predicted weights for each component
-        - mu: [N, k * d_chi] predicted mean chi angle per component
-        - kappa: [N, k * d_chi] predicted concentration per chi angle per component
+    Training (teacher forcing) — forward(h, chi_obs):
+        conditioning at chi_d uses the OBSERVED altloc chi_<d, so the
+        returned params are shape [N, A, D, k] per altloc per chi per
+        component. Loss sums log-likelihood over D autoregressively.
+    Inference — predict(h, K):
+        ancestral beam search; returns top-K joint modes [N, K, D] in the
+        same shape as the old head, so the multiconformer writer keeps
+        working.
     '''
-    def __init__(self, d_single, k = 5, d_chi = N_CHI):
-        super().__init__() # inherit module
-        # dims of outputs
+    def __init__(self, d_single, k = 5, d_chi = N_CHI, d_cond = 64):
+        super().__init__()
         self.k = k
         self.d_chi = d_chi
+        # one small MLP per chi dim; input is h plus sin/cos of all previous
+        # chi (2 features each) -> output 3*k for (pi, mu, kappa) each k-dim
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_single + 2*d, d_cond),
+                nn.SiLU(),
+                nn.Linear(d_cond, 3*k),
+            )
+            for d in range(d_chi)
+        ])
 
-        # the output layers
-        self.pi_proj = nn.Linear(d_single, k)
-        self.mu_proj = nn.Linear(d_single, k*d_chi)
-        self.kappa_proj = nn.Linear(d_single, k*d_chi)
+    # split a [..., 3k] head output into vM mixture params with the right
+    # activations: softmax(pi), pi*tanh(mu), softplus(kappa)+KAPPA_MIN
+    def _split(self, out):
+        pi_logits, mu_raw, ka_raw = out.chunk(3, dim=-1)
+        pi    = torch.softmax(pi_logits.float(), dim=-1)
+        mu    = math.pi * torch.tanh(mu_raw.float())
+        kappa = F.softplus(ka_raw.float()) + KAPPA_MIN
+        return pi, mu, kappa
 
-    # forward pass for learning and prediction
-    def forward(self, h, chi_mask=None):
-        *batch, _ = h.shape
-        k, d = self.k, self.d_chi
-        pi = torch.softmax(self.pi_proj(h).float(), dim=-1)
-        # wrap the prediction of chi angles to the circle
-        mu    = math.pi * torch.tanh(self.mu_proj(h).float()).view(*batch, k, d)
-        # concentration: softplus keeps kappa > 0, floor avoids the uniform limit
-        kappa = F.softplus(self.kappa_proj(h)).float().view(*batch, k, d) + KAPPA_MIN
-        # apply chi mask to hide chi angles that dont exist in residues
+    # training: teacher-forced autoregressive pass. chi_obs supplies the
+    # conditioning per altloc; output broadcasts over the altloc axis A.
+    def forward(self, h, chi_obs, chi_mask=None):
+        # h: [N, d_single]; chi_obs: [N, A, D]; chi_mask: [N, D]
+        N, A, D = chi_obs.shape
+        sin_chi = torch.sin(chi_obs.float())        # [N, A, D]
+        cos_chi = torch.cos(chi_obs.float())        # [N, A, D]
+        h_exp = h.unsqueeze(1).expand(N, A, h.shape[-1])  # [N, A, d_single]
+
+        pis, mus, kappas = [], [], []
+        for d in range(D):
+            if d == 0:
+                cond = h_exp                                    # [N, A, d_s]
+            else:
+                # sin/cos of chi_0..d-1 concatenated  [N, A, 2d]
+                prev = torch.cat([sin_chi[:, :, :d],
+                                  cos_chi[:, :, :d]], dim=-1)
+                cond = torch.cat([h_exp, prev], dim=-1)         # [N, A, d_s+2d]
+            pi_d, mu_d, ka_d = self._split(self.heads[d](cond)) # [N, A, k] each
+            pis.append(pi_d); mus.append(mu_d); kappas.append(ka_d)
+
+        pi    = torch.stack(pis,    dim=2)          # [N, A, D, k]
+        mu    = torch.stack(mus,    dim=2)
+        kappa = torch.stack(kappas, dim=2)
+
+        # hide chi dims that dont exist in this residue
         if chi_mask is not None:
-            m     = chi_mask[..., None, :]
+            m = chi_mask[:, None, :, None].to(torch.bool)       # [N, 1, D, 1]
             mu    = mu * m.to(mu.dtype)
             kappa = torch.where(m, kappa, torch.ones_like(kappa))
 
         return pi, mu, kappa
+
+    # inference: ancestral beam search through the AR chain. returns top-K
+    # joint modes in the same shape as the old head so downstream code (the
+    # multiconformer pdb writer, w1 eval) works unchanged.
+    @torch.no_grad()
+    def predict(self, h, chi_mask=None, K=8):
+        # h: [N, d_single]; returns pi [N, K], mu/kappa [N, K, D]
+        N = h.shape[0]
+        k = self.k
+        D = self.d_chi
+
+        # step 0: k candidate modes, no conditioning
+        pi0, mu0, ka0 = self._split(self.heads[0](h))           # [N, k]
+        cand_mu     = mu0.unsqueeze(-1)                         # [N, k, 1]
+        cand_kappa  = ka0.unsqueeze(-1)                         # [N, k, 1]
+        cand_log_pi = pi0.clamp(min=1e-8).log()                 # [N, k]
+
+        for d in range(1, D):
+            C = cand_mu.shape[1]
+            # condition on each candidate's chi so far (use the mode mu)
+            prev = torch.cat([torch.sin(cand_mu),
+                              torch.cos(cand_mu)], dim=-1)      # [N, C, 2d]
+            h_exp = h.unsqueeze(1).expand(N, C, h.shape[-1])
+            cond  = torch.cat([h_exp, prev], dim=-1)            # [N, C, d_s+2d]
+            pi_d, mu_d, ka_d = self._split(self.heads[d](cond)) # [N, C, k]
+
+            # expand each candidate by k children; joint log_pi accumulates
+            new_log_pi = (cand_log_pi.unsqueeze(-1)
+                          + pi_d.clamp(min=1e-8).log())         # [N, C, k]
+            new_log_pi = new_log_pi.reshape(N, C * k)
+            new_mu = torch.cat([
+                cand_mu.unsqueeze(2).expand(N, C, k, d),
+                mu_d.unsqueeze(-1),
+            ], dim=-1).reshape(N, C * k, d + 1)
+            new_kappa = torch.cat([
+                cand_kappa.unsqueeze(2).expand(N, C, k, d),
+                ka_d.unsqueeze(-1),
+            ], dim=-1).reshape(N, C * k, d + 1)
+
+            # beam prune: keep top K joint modes by log_pi
+            keep = min(K, new_log_pi.shape[1])
+            top_log_pi, top_idx = new_log_pi.topk(keep, dim=-1)
+            idx_d = top_idx.unsqueeze(-1).expand(-1, -1, new_mu.shape[-1])
+            cand_mu     = new_mu.gather(1, idx_d)
+            cand_kappa  = new_kappa.gather(1, idx_d)
+            cand_log_pi = top_log_pi
+
+        # renormalise joint probabilities across the kept K modes
+        pi = torch.softmax(cand_log_pi, dim=-1)                 # [N, K]
+        if chi_mask is not None:
+            m = chi_mask[:, None, :].to(torch.bool)             # [N, 1, D]
+            cand_mu    = cand_mu * m.to(cand_mu.dtype)
+            cand_kappa = torch.where(m.expand_as(cand_kappa),
+                                     cand_kappa,
+                                     torch.ones_like(cand_kappa))
+        return pi, cand_mu, cand_kappa
     
 class IPA(nn.Module):
     '''

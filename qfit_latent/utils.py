@@ -10,7 +10,7 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 
 from .data.data import N_AA, N_CHI, SYM_TBL, AA_NAMES
-from .loss import ChiGMMLoss
+from .loss import ChiARLoss
 
 def run_epoch(
     model,
@@ -26,10 +26,8 @@ def run_epoch(
 
     # keep track of loss function
     run_loss = 0.0
-    # number of proteins 
+    # number of proteins
     n = 0
-    # learning rate storage
-    lr_history = []
 
     aa_sum = torch.zeros(N_AA, dtype=torch.float64)
     aa_count = torch.zeros(N_AA, dtype=torch.float64)
@@ -55,7 +53,8 @@ def run_epoch(
         sym_mask = sym_tbl[aa]
 
         with torch.set_grad_enabled(training):
-            pi, mu, kappa = model(aa, R, t)
+            # teacher-forced autoregressive head: pass chi_angles for conditioning
+            pi, mu, kappa = model(aa, R, t, chi_obs=chi_angles)
 
             out = loss_function(
                 pi, mu, kappa,
@@ -75,11 +74,6 @@ def run_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
-
-            # track learning rate
-            current_step = scheduler.last_epoch
-            current_lr = scheduler.get_last_lr()
-            lr_history.append((current_step, current_lr[0]))
 
         # iterate
         run_loss += loss.item()
@@ -115,7 +109,6 @@ def run_epoch(
     return {
         "total": avg_loss,
         "per_aa": per_aa,
-        "learning_rates": lr_history
     }
 
 def train(
@@ -150,8 +143,8 @@ def train(
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
-    # the loss function
-    loss_fn = ChiGMMLoss()
+    # the loss function (autoregressive vM NLL)
+    loss_fn = ChiARLoss()
 
     # data loaders
     train_loader = DataLoader(
@@ -187,14 +180,6 @@ def train(
     if write_header:
         writer.writerow(_csv_header(has_val))
 
-    # the learning rate csv tracker:
-    lr_csv = loss_csv.with_name(loss_csv.stem + "_lr.csv")
-    write_lr_header = not lr_csv.exists() or lr_csv.stat().st_size == 0
-    lr_fh = open(lr_csv, "a", newline="")
-    lr_writer = csv.writer(lr_fh)
-    if write_lr_header:
-        lr_writer.writerow(["step", "learning rate"])
-
     # iterate through epochs and train
     for epoch in range(start_epoch, start_epoch + epochs):
 
@@ -222,13 +207,7 @@ def train(
         writer.writerow(_row(epoch + 1, tr, val))
         csv_fh.flush()
 
-        # log the learning rate 
-        if tr["learning_rates"]:
-            for step_num, step_lr in tr["learning_rates"]:
-                lr_writer.writerow([step_num, step_lr])
-            lr_fh.flush()
-
-        # save the stat of the model/optimizer/scheduler to checkpoint 
+        # save the stat of the model/optimizer/scheduler to checkpoint
         if (epoch + 1) % save_every == 0:
             ckpt = {"epoch": epoch + 1, "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
